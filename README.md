@@ -10,8 +10,8 @@ The official caveman installer wires an always-on **hook only for Claude Code**.
 
 | File | Purpose |
 |------|---------|
-| `setup.sh` | Cross-platform installer + global-rule injector (macOS / Linux / Windows Git Bash). |
-| `caveman-rule.md` | Single source of the caveman activation instruction. Edit this to change behavior everywhere. |
+| `setup.sh` | Cross-platform installer + global-rule wirer (macOS / Linux / Windows Git Bash). |
+| `CAVEMAN.md` | Single source of the caveman activation instruction. Edit this to change behavior everywhere. |
 | `.gitignore` | Ignores `.claude/` local config and the usual junk. |
 
 ## Quick start
@@ -28,23 +28,26 @@ bash setup.sh
 
 ## What `setup.sh` does
 
-1. **Installs caveman per agent** via the official installer:
-   - **Claude Code** — `install.sh` (macOS/Linux via `curl | bash`) or `install.ps1` (Windows via PowerShell). Gets plugin + hooks + statusline.
-   - **Codex CLI** — `npx skills add JuliusBrussee/caveman -a codex`.
-   - **Antigravity** — `npx github:JuliusBrussee/caveman -- --only antigravity`, then copies skills into `~/.gemini/config/skills`.
-2. **Injects the caveman instruction** from `caveman-rule.md` into each global rule file, wrapped in idempotent markers:
-   - Claude Code → `~/.claude/CLAUDE.md`
-   - Codex CLI → `~/.codex/AGENTS.md`
-   - Antigravity → `~/.gemini/config/GEMINI.md`
+1. **Installs caveman per agent** via the official installer (`npx github:JuliusBrussee/caveman`), always with `--only <agent> --non-interactive` so it never shows the agent/skill selection TUI (that picker hangs under Git Bash / mintty):
+   - **Claude Code** — `--only claude --with-hooks`. Gets plugin + hooks + statusline.
+   - **Codex CLI** — `--only codex` (installer runs `skills add … --yes --all` internally).
+   - **Antigravity** — `--only antigravity`, then copies skills into `~/.gemini/config/skills`.
+2. **Copies `CAVEMAN.md` into each agent's rule dir**, then wires a *reference* (not the body) into that agent's global rule file, using each agent's native include mechanism:
 
-Re-running is safe: the managed block is replaced in place, never duplicated.
+   | Agent | Copy lands at | Reference written into | Reference syntax |
+   |-------|---------------|------------------------|------------------|
+   | Claude Code | `~/.claude/CAVEMAN.md` | `~/.claude/CLAUDE.md` | `@~/.claude/CAVEMAN.md` |
+   | Codex CLI | `~/.codex/CAVEMAN.md` | `~/.codex/AGENTS.md` | `@~/.codex/CAVEMAN.md` |
+   | Antigravity | `~/.gemini/CAVEMAN.md` | `~/.gemini/GEMINI.md` | `view_file("~/.gemini/CAVEMAN.md")` |
+
+   The reference is wrapped in idempotent markers. Re-running replaces it in place (and migrates any old full-body block from earlier versions). Edit the rule once in `CAVEMAN.md`, re-run, and all three agents pick it up.
 
 ## Flags
 
 | Flag | Effect |
 |------|--------|
 | (none) | Full install + rule injection. |
-| `--rules-only` | Only (re)write the global rule blocks. Use after editing `caveman-rule.md`. |
+| `--rules-only` | Only (re)write the global rule blocks. Use after editing `CAVEMAN.md`. |
 | `--no-rules` | Only run the installers, skip rule injection. |
 | `--dry-run` | Print every action, change nothing. |
 | `-h`, `--help` | Show usage. |
@@ -53,7 +56,7 @@ Override the per-command timeout (default 300s) with `CAVEMAN_TIMEOUT=600 bash s
 
 ## Changing the default behavior
 
-The default caveman level is **full**. To change wording or level, edit `caveman-rule.md`, then push it to all three agents:
+The default caveman level is **full**. To change wording or level, edit `CAVEMAN.md`, then push it to all three agents:
 
 ```bash
 bash setup.sh --rules-only

@@ -3,7 +3,7 @@
 # caveman new-machine setup — Claude Code + Codex CLI + Google Antigravity
 #
 # Installs the caveman skill/plugin via the official installer, then writes the
-# caveman activation instruction (from ./caveman-rule.md) straight into each
+# caveman activation instruction (from ./CAVEMAN.md) straight into each
 # agent's GLOBAL rule file so the mode is always-on (no per-session /caveman).
 #
 # Works on macOS / Linux and on Windows via Git Bash (or WSL).
@@ -23,7 +23,7 @@ REPO="JuliusBrussee/caveman"
 CMD_TIMEOUT="${CAVEMAN_TIMEOUT:-300}"   # seconds, per install command
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-RULE_FILE="$SCRIPT_DIR/caveman-rule.md"  # single source of the instruction
+RULE_SRC="$SCRIPT_DIR/CAVEMAN.md"        # single source of the instruction
 
 DRY_RUN=0
 DO_INSTALL=1
@@ -50,12 +50,12 @@ esac
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CODEX_DIR="$HOME/.codex"
-GEMINI_DIR="$HOME/.gemini/config"        # Antigravity config home
+GEMINI_DIR="$HOME/.gemini"               # Antigravity rule home (AKS.md/GEMINI.md live here)
 
 CLAUDE_RULE="$CLAUDE_DIR/CLAUDE.md"      # Claude Code global rule
 CODEX_RULE="$CODEX_DIR/AGENTS.md"        # Codex CLI global rule
 GEMINI_RULE="$GEMINI_DIR/GEMINI.md"      # Antigravity / Gemini global rule
-GEMINI_SKILLS="$GEMINI_DIR/skills"
+GEMINI_SKILLS="$GEMINI_DIR/config/skills"  # installer drops skills here
 
 MARK_BEGIN="<!-- BEGIN CAVEMAN (managed by ag-caveman/setup.sh) -->"
 MARK_END="<!-- END CAVEMAN -->"
@@ -80,40 +80,54 @@ run() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Inject (or replace) the caveman block in a rule file, idempotently.
-# Body is read from $RULE_FILE.
-inject_rule() {
-  local file="$1" label="$2"
+# Copy CAVEMAN.md into an agent's rule dir, then wire a reference into that
+# agent's global rule file. The reference (not the body) lives in the rule file,
+# wrapped in idempotent markers so re-running replaces it in place — and so any
+# OLD full-body block from a previous setup.sh version is migrated to a ref.
+#
+#   $1 rule_file   global rule file to edit (CLAUDE.md / AGENTS.md / GEMINI.md)
+#   $2 copy_dest   where CAVEMAN.md is copied (per-agent dir)
+#   $3 ref_line    the reference line written into the rule file
+#   $4 label       human label for logs
+wire_rule() {
+  local file="$1" dest="$2" ref="$3" label="$4"
   local dir; dir="$(dirname "$file")"
 
-  if [ ! -f "$RULE_FILE" ]; then
-    warn "rule source missing: $RULE_FILE — skipping $label"; return 1
+  if [ ! -f "$RULE_SRC" ]; then
+    warn "rule source missing: $RULE_SRC — skipping $label"; return 1
   fi
 
   if [ "$DRY_RUN" = 1 ]; then
-    echo "DRY: inject $RULE_FILE -> $file ($label)"; return 0
+    echo "DRY: cp $RULE_SRC -> $dest"
+    echo "DRY: ensure ref in $file ($label):  $ref"
+    return 0
   fi
 
+  # 1. copy the rule file into the agent's dir
+  mkdir -p "$(dirname "$dest")"
+  cp -f "$RULE_SRC" "$dest"
+  log "copied CAVEMAN.md -> $dest"
+
+  # 2. wire the reference into the global rule file
   mkdir -p "$dir"
   [ -f "$file" ] || : > "$file"
 
   local block tmp
-  block="$(printf '%s\n%s\n%s\n' "$MARK_BEGIN" "$(cat "$RULE_FILE")" "$MARK_END")"
+  block="$(printf '%s\n%s\n%s\n' "$MARK_BEGIN" "$ref" "$MARK_END")"
   tmp="$(mktemp)"
 
   if grep -qF "$MARK_BEGIN" "$file"; then
-    # replace existing managed block
     awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v repl="$block" '
       $0==b {print repl; skip=1; next}
       $0==e {skip=0; next}
       skip!=1 {print}
     ' "$file" > "$tmp"
     mv "$tmp" "$file"
-    log "updated caveman block -> $file ($label)"
+    log "updated caveman ref -> $file ($label)"
   else
     { [ -s "$file" ] && printf '\n'; printf '%s\n' "$block"; } >> "$file"
     rm -f "$tmp"
-    log "added caveman block -> $file ($label)"
+    log "added caveman ref -> $file ($label)"
   fi
 }
 
@@ -128,31 +142,27 @@ install_caveman() {
     return 1
   fi
 
-  # Claude Code: plugin + hooks + statusline
-  if [ "$OS" = windows ]; then
-    log "Claude: install.ps1 via PowerShell"
-    run powershell.exe -NoProfile -Command \
-      "irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex" \
-      || warn "Claude installer failed (continuing)"
-  else
-    log "Claude: install.sh via curl|bash"
-    if have curl; then
-      run bash -c "curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash" \
-        || warn "Claude installer failed (continuing)"
-    else
-      warn "curl missing; falling back to npx for Claude"
-      run npx -y "github:$REPO" -- --only claude --with-hooks \
-        || warn "Claude npx installer failed (continuing)"
-    fi
-  fi
+  # All three agents go through the SAME official installer (bin/install.js)
+  # invoked via npx. We always pass `--only <agent>` and `--non-interactive`
+  # so the installer never renders its agent/skill selection TUI — that picker
+  # is unusable under Git Bash (mintty): arrow keys / space don't register and
+  # the run hangs. `--only` preselects the agent; the installer then drives the
+  # inner `skills add` with `--yes --all` itself, so no sub-prompt either.
 
-  # Codex CLI: skill via npx-skills
-  log "Codex: npx skills add $REPO -a codex"
-  run npx -y skills add "$REPO" -a codex || warn "Codex installer failed (continuing)"
+  # Claude Code: plugin + hooks + statusline
+  log "Claude: --only claude --with-hooks (non-interactive)"
+  run npx -y "github:$REPO" -- --only claude --with-hooks --non-interactive \
+    || warn "Claude installer failed (continuing)"
+
+  # Codex CLI: skill (installer runs `skills add ... --yes --all` internally)
+  log "Codex: --only codex (non-interactive)"
+  run npx -y "github:$REPO" -- --only codex --non-interactive \
+    || warn "Codex installer failed (continuing)"
 
   # Google Antigravity: soft-probe agent, force with --only
-  log "Antigravity: npx ... --only antigravity"
-  run npx -y "github:$REPO" -- --only antigravity || warn "Antigravity installer failed (continuing)"
+  log "Antigravity: --only antigravity (non-interactive)"
+  run npx -y "github:$REPO" -- --only antigravity --non-interactive \
+    || warn "Antigravity installer failed (continuing)"
 
   # Antigravity may drop skills project-locally (./.agents/skills); make sure
   # they also live in the Gemini config skills dir, then clean project junk.
@@ -168,10 +178,14 @@ install_caveman() {
 # Step 2 — write the global rule blocks
 # ---------------------------------------------------------------------------
 inject_all_rules() {
-  log "injecting caveman instruction into global rules (source: $RULE_FILE)"
-  inject_rule "$CLAUDE_RULE" "Claude Code"
-  inject_rule "$CODEX_RULE"  "Codex CLI"
-  inject_rule "$GEMINI_RULE" "Antigravity / Gemini"
+  log "wiring CAVEMAN.md into global rules (source: $RULE_SRC)"
+  # Claude & Codex: native @import of their own copy.
+  wire_rule "$CLAUDE_RULE" "$CLAUDE_DIR/CAVEMAN.md" '@~/.claude/CAVEMAN.md'  "Claude Code"
+  wire_rule "$CODEX_RULE"  "$CODEX_DIR/CAVEMAN.md"  '@~/.codex/CAVEMAN.md'   "Codex CLI"
+  # Antigravity: no @import — it reads files via view_file(), like ~/.gemini/AKS.md.
+  wire_rule "$GEMINI_RULE" "$GEMINI_DIR/CAVEMAN.md" \
+    'Before doing anything, you MUST execute: `view_file("~/.gemini/CAVEMAN.md")`' \
+    "Antigravity / Gemini"
 }
 
 # ---------------------------------------------------------------------------
