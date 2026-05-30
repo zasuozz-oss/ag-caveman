@@ -56,6 +56,10 @@ CLAUDE_RULE="$CLAUDE_DIR/CLAUDE.md"      # Claude Code global rule
 CODEX_RULE="$CODEX_DIR/AGENTS.md"        # Codex CLI global rule
 GEMINI_RULE="$GEMINI_DIR/GEMINI.md"      # Antigravity / Gemini global rule
 GEMINI_SKILLS="$GEMINI_DIR/config/skills"  # installer drops skills here
+CODEX_SKILLS="$CODEX_DIR/skills"           # Codex reads global skills here
+CODEX_CONFIG="$CODEX_DIR/config.toml"      # Codex global config (MCP servers)
+
+MCP_SHRINK_PKG="caveman-shrink"            # npm pkg for the MCP shrink proxy
 
 MARK_BEGIN="<!-- BEGIN CAVEMAN (managed by ag-caveman/setup.sh) -->"
 MARK_END="<!-- END CAVEMAN -->"
@@ -164,14 +168,68 @@ install_caveman() {
   run npx -y "github:$REPO" -- --only antigravity --non-interactive \
     || warn "Antigravity installer failed (continuing)"
 
-  # Antigravity may drop skills project-locally (./.agents/skills); make sure
-  # they also live in the Gemini config skills dir, then clean project junk.
-  if [ -d "./.agents/skills" ] && [ ! -d "$GEMINI_SKILLS/caveman" ]; then
-    log "copying antigravity skills -> $GEMINI_SKILLS"
-    mkdir -p "$GEMINI_SKILLS"
-    cp -R ./.agents/skills/* "$GEMINI_SKILLS"/ 2>/dev/null || true
+  # The universal `skills add` step (codex/antigravity) drops skills into the
+  # project-local ./.agents/skills dir, NOT into each agent's GLOBAL skills dir.
+  # Mirror them into the global dirs so the agents actually see caveman, then
+  # clean the project junk. (Without this, codex/antigravity get no skills.)
+  if [ -d "./.agents/skills" ]; then
+    if [ ! -d "$GEMINI_SKILLS/caveman" ]; then
+      log "copying skills -> $GEMINI_SKILLS (Antigravity)"
+      mkdir -p "$GEMINI_SKILLS"
+      cp -R ./.agents/skills/* "$GEMINI_SKILLS"/ 2>/dev/null || true
+    fi
+    if [ ! -d "$CODEX_SKILLS/caveman" ]; then
+      log "copying skills -> $CODEX_SKILLS (Codex)"
+      mkdir -p "$CODEX_SKILLS"
+      cp -R ./.agents/skills/* "$CODEX_SKILLS"/ 2>/dev/null || true
+    fi
   fi
   [ -d "./.agents" ] && rm -rf "./.agents" 2>/dev/null || true
+
+  # Optionally wire the caveman-shrink MCP proxy for codex. NOTE: caveman-shrink
+  # is NOT a standalone server — it's a middleware that must WRAP an upstream MCP
+  # command (`caveman-shrink <upstream-cmd> [args]`). Registered bare it exits 2
+  # ("missing upstream command") and codex reports a failed handshake. So we only
+  # register it when the caller names an upstream to wrap via CAVEMAN_SHRINK_UPSTREAM.
+  #
+  #   CAVEMAN_SHRINK_UPSTREAM="codegraph serve --mcp" bash setup.sh
+  #
+  # registers a [mcp_servers.codegraph] that pipes codegraph through the shrinker.
+  wire_codex_mcp
+}
+
+# Register a caveman-shrink-wrapped MCP server in codex's global config.toml,
+# but ONLY when CAVEMAN_SHRINK_UPSTREAM names the upstream command to wrap.
+# Idempotent: skips if the target [mcp_servers.<name>] table already exists.
+wire_codex_mcp() {
+  local upstream="${CAVEMAN_SHRINK_UPSTREAM:-}"
+  if [ -z "$upstream" ]; then
+    log "codex MCP: CAVEMAN_SHRINK_UPSTREAM unset — skipping (shrink proxy needs an upstream to wrap)"
+    return 0
+  fi
+
+  # Name the wrapped server after the upstream's first token.
+  local name; name="${upstream%% *}"
+  # Build a TOML string array of: caveman-shrink <upstream tokens...>
+  local arr='"-y", "'"$MCP_SHRINK_PKG"'"' tok
+  for tok in $upstream; do arr="$arr, \"$tok\""; done
+
+  local block
+  block="$(printf '\n[mcp_servers.%s]\ncommand = "npx"\nargs = [%s]\n' "$name" "$arr")"
+
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY: register wrapped MCP [mcp_servers.$name] in $CODEX_CONFIG -> npx $MCP_SHRINK_PKG $upstream"
+    return 0
+  fi
+
+  if [ -f "$CODEX_CONFIG" ] && grep -qF "[mcp_servers.$name]" "$CODEX_CONFIG"; then
+    warn "codex MCP [$name] already present in $CODEX_CONFIG — leaving as-is (edit manually to wrap)"
+    return 0
+  fi
+
+  mkdir -p "$CODEX_DIR"
+  printf '%s' "$block" >> "$CODEX_CONFIG"
+  log "registered shrink-wrapped MCP [$name] -> $CODEX_CONFIG"
 }
 
 # ---------------------------------------------------------------------------
