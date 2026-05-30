@@ -1,0 +1,16 @@
+# Claude Code local config
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Node
+node_modules/
+
+# Antigravity / installer leftovers
+.agents/
