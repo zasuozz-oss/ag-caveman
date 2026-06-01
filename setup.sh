@@ -57,6 +57,7 @@ CODEX_RULE="$CODEX_DIR/AGENTS.md"        # Codex CLI global rule
 GEMINI_RULE="$GEMINI_DIR/GEMINI.md"      # Antigravity / Gemini global rule
 GEMINI_SKILLS="$GEMINI_DIR/config/skills"  # installer drops skills here
 CODEX_SKILLS="$CODEX_DIR/skills"           # Codex reads global skills here
+CLAUDE_SKILLS="$CLAUDE_DIR/skills"         # Claude reads global skills here
 CODEX_CONFIG="$CODEX_DIR/config.toml"      # Codex global config (MCP servers)
 
 MCP_SHRINK_PKG="caveman-shrink"            # npm pkg for the MCP shrink proxy
@@ -183,6 +184,21 @@ install_caveman() {
       mkdir -p "$CODEX_SKILLS"
       cp -R ./.agents/skills/* "$CODEX_SKILLS"/ 2>/dev/null || true
     fi
+    # Claude: the official installer SYMLINKS ~/.claude/skills/<skill> at
+    # ../../.agents/skills (i.e. ~/.agents/skills), but the real files land in the
+    # project-local ./.agents/skills and get deleted by the rm below — leaving
+    # broken links (and Finder alias badges). Replace any caveman symlink/stub with
+    # a REAL copy from the source that's actually present.
+    mkdir -p "$CLAUDE_SKILLS"
+    for s in ./.agents/skills/*/; do
+      [ -d "$s" ] || continue
+      sn="$(basename "$s")"
+      if [ -L "$CLAUDE_SKILLS/$sn" ] || [ ! -e "$CLAUDE_SKILLS/$sn" ]; then
+        rm -rf "$CLAUDE_SKILLS/$sn"
+        cp -R "$s" "$CLAUDE_SKILLS/$sn" 2>/dev/null \
+          && log "materialized Claude skill $sn (was symlink/missing)"
+      fi
+    done
   fi
   [ -d "./.agents" ] && rm -rf "./.agents" 2>/dev/null || true
 
