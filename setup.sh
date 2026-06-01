@@ -58,6 +58,7 @@ GEMINI_RULE="$GEMINI_DIR/GEMINI.md"      # Antigravity / Gemini global rule
 GEMINI_SKILLS="$GEMINI_DIR/config/skills"  # installer drops skills here
 CODEX_SKILLS="$CODEX_DIR/skills"           # Codex reads global skills here
 CLAUDE_SKILLS="$CLAUDE_DIR/skills"         # Claude reads global skills here
+CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"  # Claude Code global settings (env/permissions/hooks/...)
 CODEX_CONFIG="$CODEX_DIR/config.toml"      # Codex global config (MCP servers)
 
 MCP_SHRINK_PKG="caveman-shrink"            # npm pkg for the MCP shrink proxy
@@ -136,6 +137,200 @@ wire_rule() {
   fi
 }
 
+# Snapshot ~/.claude/settings.json before the official installer runs.
+# The upstream caveman installer (--with-hooks) rewrites settings.json from a
+# template and keeps only a subset of keys, silently dropping anything it does
+# not know about (env, permissions.deny/defaultMode, autoCompact*, theme,
+# enabledPlugins, hasCompletedOnboarding, skipDangerousModePermissionPrompt,
+# and any pre-existing hooks). We snapshot here and merge the dropped keys back
+# in restore_claude_settings() after the installer finishes.
+SETTINGS_SNAPSHOT=""
+snapshot_claude_settings() {
+  SETTINGS_SNAPSHOT=""
+  [ -f "$CLAUDE_SETTINGS" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY: snapshot $CLAUDE_SETTINGS before caveman installer"
+    return 0
+  fi
+  SETTINGS_SNAPSHOT="$(mktemp)"
+  cp -f "$CLAUDE_SETTINGS" "$SETTINGS_SNAPSHOT"
+  log "snapshotted settings.json (will restore caveman-dropped keys after install)"
+}
+
+# Merge the pre-install snapshot back into the post-install settings.json so the
+# installer's destructive rewrite cannot lose user config. The installer's own
+# additions (caveman hooks, etc.) are preserved; snapshot only FILLS keys the
+# installer dropped — it never overwrites what the installer set. Arrays
+# (permissions.allow/deny) and hooks are unioned (dedup by command).
+restore_claude_settings() {
+  [ -n "$SETTINGS_SNAPSHOT" ] || return 0
+  [ -f "$SETTINGS_SNAPSHOT" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY: merge snapshot back into $CLAUDE_SETTINGS"
+    return 0
+  fi
+  if ! have node; then
+    warn "node not found — cannot merge settings.json; snapshot kept at $SETTINGS_SNAPSHOT"
+    return 0
+  fi
+  node - "$CLAUDE_SETTINGS" "$SETTINGS_SNAPSHOT" <<'NODE'
+const fs = require('node:fs');
+const [newF, oldF] = process.argv.slice(2);
+let nw = {}, od = {};
+try { nw = JSON.parse(fs.readFileSync(newF, 'utf8')); } catch {}
+try { od = JSON.parse(fs.readFileSync(oldF, 'utf8')); } catch { process.exit(0); }
+
+// 1. Restore any top-level key the installer dropped (env, model, theme,
+//    autoCompactEnabled, enabledPlugins, hasCompletedOnboarding, ...).
+for (const k of Object.keys(od)) {
+  if (!(k in nw)) nw[k] = od[k];
+}
+
+// 2. env: old fills gaps, never clobber what the installer set.
+if (od.env && typeof od.env === 'object') {
+  nw.env = { ...od.env, ...(nw.env || {}) };
+}
+
+// 3. permissions: union allow/deny arrays; restore defaultMode/other subkeys.
+if (od.permissions && typeof od.permissions === 'object') {
+  nw.permissions = nw.permissions || {};
+  for (const arr of ['allow', 'deny']) {
+    const merged = [...new Set([...(nw.permissions[arr] || []), ...(od.permissions[arr] || [])])];
+    if (merged.length || arr in nw.permissions || arr in od.permissions) nw.permissions[arr] = merged;
+  }
+  for (const sk of Object.keys(od.permissions)) {
+    if (!(sk in nw.permissions)) nw.permissions[sk] = od.permissions[sk];
+  }
+}
+
+// 4. hooks: union per event; keep installer's hooks AND the user's old ones,
+//    dedup by command string.
+if (od.hooks && typeof od.hooks === 'object') {
+  nw.hooks = nw.hooks || {};
+  for (const [ev, entries] of Object.entries(od.hooks)) {
+    if (!Array.isArray(entries)) continue;
+    if (!nw.hooks[ev]) { nw.hooks[ev] = entries; continue; }
+    const have = new Set(nw.hooks[ev].flatMap((e) => (e.hooks || []).map((h) => h.command)));
+    for (const e of entries) {
+      const cmds = (e.hooks || []).map((h) => h.command);
+      if (!cmds.some((c) => have.has(c))) nw.hooks[ev].push(e);
+    }
+  }
+}
+
+fs.writeFileSync(newF, JSON.stringify(nw, null, 2) + '\n');
+NODE
+  log "restored caveman-dropped settings.json keys (env/permissions/hooks/...) from snapshot"
+  rm -f "$SETTINGS_SNAPSHOT"
+  SETTINGS_SNAPSHOT=""
+}
+
+# Snapshot ~/.codex/config.toml before the official installer runs. config.toml
+# holds MCP servers, per-project trust_level, plugin/marketplace state and TUI
+# prefs — none of which the caveman installer manages. The same defensive guard
+# we use for Claude: snapshot here, then in restore_codex_config() fill back any
+# table or top-level key the installer dropped. (Codex itself reorders the file
+# on every run, which is fine — the merge is keyed on table headers, not order.)
+CODEX_SNAPSHOT=""
+snapshot_codex_config() {
+  CODEX_SNAPSHOT=""
+  [ -f "$CODEX_CONFIG" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY: snapshot $CODEX_CONFIG before caveman installer"
+    return 0
+  fi
+  CODEX_SNAPSHOT="$(mktemp)"
+  cp -f "$CODEX_CONFIG" "$CODEX_SNAPSHOT"
+  log "snapshotted config.toml (will restore installer-dropped tables/keys after install)"
+}
+
+# Merge the pre-install snapshot back into config.toml: any TOML table or
+# top-level key present in the snapshot but missing afterwards is appended. The
+# installer's additions/reordering are preserved — we only FILL gaps, never
+# overwrite. TOML tables are order-independent, so appending a dropped block at
+# the end is valid.
+restore_codex_config() {
+  [ -n "$CODEX_SNAPSHOT" ] || return 0
+  [ -f "$CODEX_SNAPSHOT" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY: merge snapshot back into $CODEX_CONFIG"
+    return 0
+  fi
+  if ! have node; then
+    warn "node not found — cannot merge config.toml; snapshot kept at $CODEX_SNAPSHOT"
+    return 0
+  fi
+  node - "$CODEX_CONFIG" "$CODEX_SNAPSHOT" <<'NODE'
+const fs = require('node:fs');
+const [newF, oldF] = process.argv.slice(2);
+let newText, oldText;
+try { newText = fs.readFileSync(newF, 'utf8'); } catch { process.exit(0); }
+try { oldText = fs.readFileSync(oldF, 'utf8'); } catch { process.exit(0); }
+
+// Split a TOML document into a preamble (top-level key=val lines before the
+// first table header) and an ordered list of { header, text } blocks. A header
+// is a line like `[table]` or `[[array]]`; identity is the trimmed header text.
+function parse(text) {
+  const lines = text.split('\n');
+  const preamble = [];
+  const blocks = [];
+  let cur = null;
+  for (const line of lines) {
+    if (/^\s*\[.*\]\s*$/.test(line)) {
+      if (cur) blocks.push(cur);
+      cur = { header: line.trim(), lines: [line] };
+    } else if (cur) {
+      cur.lines.push(line);
+    } else {
+      preamble.push(line);
+    }
+  }
+  if (cur) blocks.push(cur);
+  return { preamble, blocks };
+}
+
+// top-level bare key from a `key = value` line (skip comments/blanks)
+function bareKey(line) {
+  const m = line.match(/^\s*([A-Za-z0-9_."'-]+)\s*=/);
+  return m ? m[1] : null;
+}
+
+const nw = parse(newText);
+const od = parse(oldText);
+
+// 1. Tables present in old but missing in new → append them verbatim.
+const haveHeaders = new Set(nw.blocks.map((b) => b.header));
+const appended = [];
+for (const b of od.blocks) {
+  if (!haveHeaders.has(b.header)) appended.push(b);
+}
+
+// 2. Top-level keys present in old preamble but missing in new preamble.
+const newKeys = new Set(nw.preamble.map(bareKey).filter(Boolean));
+const restoredKeys = od.preamble.filter((l) => {
+  const k = bareKey(l);
+  return k && !newKeys.has(k);
+});
+
+if (appended.length === 0 && restoredKeys.length === 0) process.exit(0);
+
+let out = newText.replace(/\s*$/, '\n');
+if (restoredKeys.length) {
+  // Prepend restored bare keys ahead of the first table so they stay top-level.
+  const idx = out.search(/^\s*\[.*\]\s*$/m);
+  const inject = restoredKeys.join('\n') + '\n';
+  out = idx === -1 ? out + inject : out.slice(0, idx) + inject + out.slice(idx);
+}
+for (const b of appended) {
+  out = out.replace(/\s*$/, '\n') + '\n' + b.lines.join('\n').replace(/\s*$/, '') + '\n';
+}
+fs.writeFileSync(newF, out);
+NODE
+  log "restored installer-dropped config.toml tables/keys from snapshot"
+  rm -f "$CODEX_SNAPSHOT"
+  CODEX_SNAPSHOT=""
+}
+
 # ---------------------------------------------------------------------------
 # Step 1 — install caveman for each agent (official installer)
 # ---------------------------------------------------------------------------
@@ -155,14 +350,22 @@ install_caveman() {
   # inner `skills add` with `--yes --all` itself, so no sub-prompt either.
 
   # Claude Code: plugin + hooks + statusline
+  # Snapshot settings.json first: the installer's --with-hooks rewrite drops
+  # any keys it doesn't manage. We merge them back right after.
+  snapshot_claude_settings
   log "Claude: --only claude --with-hooks (non-interactive)"
   run npx -y "github:$REPO" -- --only claude --with-hooks --non-interactive \
     || warn "Claude installer failed (continuing)"
+  restore_claude_settings
 
   # Codex CLI: skill (installer runs `skills add ... --yes --all` internally)
+  # Snapshot config.toml first: guard its MCP servers / trust_levels / plugins
+  # against any destructive rewrite, then fill back anything dropped.
+  snapshot_codex_config
   log "Codex: --only codex (non-interactive)"
   run npx -y "github:$REPO" -- --only codex --non-interactive \
     || warn "Codex installer failed (continuing)"
+  restore_codex_config
 
   # Google Antigravity: soft-probe agent, force with --only
   log "Antigravity: --only antigravity (non-interactive)"
